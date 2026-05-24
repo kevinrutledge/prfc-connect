@@ -2,9 +2,9 @@
 
 ## Introduction
 
-PRFC Connect is a web application I built for the Paso Robles Food Co-op, a member-owned grocery cooperative. The application tracks member referrals and sends group email and text messages to members. It stores the names, email addresses, and phone numbers of about 389 members. Because that data identifies real people, every request has to prove who is asking and what they may do before the database is touched.
+PRFC Connect is a web application I built for the Paso Robles Food Co-op, a member-owned grocery cooperative. The application tracks member referrals and sends group email and text messages to members. It stores the names, email addresses, and phone numbers of about 389 members. Because that data identifies real people, every request has to prove who is asking and what they may do before the database is touched. Protecting it comes down to two goals from the CIA triad. Confidentiality keeps the wrong people from reading it, and integrity keeps the wrong people from changing it.
 
-This report explains the security architecture and shows, with code, how the application defends against the most common web risks. I organize the defenses around the OWASP Top 10:2025, a widely used list of the ten most common web application risks. First I describe the general architecture. Then I walk through six small pieces of code. One covers the session, and one covers each of the five core defenses. After that I summarize how the remaining OWASP categories are handled, state the limitations honestly, and document how the next student team takes the project over.
+This report explains the security architecture and shows, with code, how the application defends against the most common web risks. I organize the defenses around the OWASP Top 10:2025, a widely used list of the ten most common web application risks. First I describe the general architecture. Then I walk through small pieces of code that cover the session, access control, and each of the five core defenses. After that I summarize how the remaining OWASP categories are handled, state the limitations honestly, and document how the next student team takes the project over.
 
 The thesis is that a request moves through four gates that run in order. First it authenticates the user, then it authorizes the action, then it validates the input, and last it reaches the database. Each gate runs on its own, so if one gate has a bug, the others still block the request. This is defense in depth.
 
@@ -14,9 +14,11 @@ The application is built on Next.js, and it keeps a strict separation between co
 
 A member deleting a contact group shows the four gates in action. First, the proxy at [`src/proxy.ts`](../src/proxy.ts) checks that a session cookie is present and redirects to `/unauthorized` if it is not. Then the server action runs `verifySession()` as its first line, which rejects anyone without a valid signed cookie. Next, the action checks ownership, so a member cannot delete a group that belongs to someone else. Then a Zod schema validates the input. Only after all four checks pass does the service run the Prisma query. The data access layer is the real boundary, because it runs even when the proxy is bypassed.
 
+This design follows several well-known security principles. Checking the session and ownership on every request, with no trusted path around the data access layer, is complete mediation. Rejecting a request the moment a gate fails, instead of letting it through, is fail-safe defaults. The cookie format is public and only the signing key stays secret, which is open design rather than security by obscurity. And the four independent gates are defense in depth.
+
 ## The session is a signed cookie
 
-The application keeps no session table. Instead, the session is a single cookie whose value is signed proof of identity. The format is `ownerid|isAdmin|timestamp|signature`, and the signature is the first eight hex characters of an HMAC-SHA256 over the first three fields. Because the signature depends on a server-side secret, a user cannot forge or edit the cookie without breaking it.
+The application keeps no session table. Instead, the session is a single cookie whose value is signed proof of identity. The format is `ownerid|isAdmin|timestamp|signature`, and the signature is the first eight hex characters of an HMAC-SHA256 over the first three fields. An HMAC is a message authentication code. Because it mixes in a secret key, it proves two things a plain hash cannot, that the fields are unchanged (integrity) and that they came from the server (authenticity). It also resists the length-extension trick that can fool a raw hash. Because the signature depends on a server-side secret, a user cannot forge or edit the cookie without breaking it.
 
 The function that proves a cookie is genuine lives in [`src/lib/dal.ts`](../src/lib/dal.ts).
 
@@ -42,6 +44,19 @@ export function validateToken(token: string, secret: string): Session | null {
 ```
 
 The signature is verified first, so a tampered cookie never reaches the timestamp logic. Then the timestamp is checked against a one-hour window, so a stolen cookie stops working after sixty minutes. Finally the owner id is parsed and bounded, so a malformed value is rejected rather than trusted. Every server action calls `verifySession()`, which reads the cookie and runs this function, so this one check stands in front of the entire authenticated surface of the app. Because the proof lives in the cookie and nowhere else, there is nothing on the server for an attacker to steal.
+
+## Access control
+
+The session proves who you are. Access control decides what you may do. Every server action runs an authorization check after `verifySession()` and before it touches the database. The check in [`src/actions/contact-group.ts`](../src/actions/contact-group.ts) is typical.
+
+```ts
+if (!session.isAdmin && !(await isGroupOwner(validGroupId, session.ownerid))) {
+  console.error("[ACCESS_DENIED] deleteContactGroup", session.ownerid, validGroupId);
+  return { success: false, error: "You do not have permission to delete this group" };
+}
+```
+
+This is role-based access control with record ownership. An administrator may act on any group, a member may act only on the groups they own, and everyone else is denied by default. The rule behind it is least privilege, so each user gets the smallest set of rights the task needs. A member who learns another group's id still cannot change it, because the ownership check runs on the server, not in the browser. Together the session check and these authorization checks are the first two parts of AAA, authentication and authorization. The third part, accounting, is the audit log described later.
 
 ## Five defenses
 
@@ -85,7 +100,7 @@ function verifyHmac(payload: string, signature: string, secret: string): boolean
 }
 ```
 
-The application recomputes the expected signature from the payload and compares it with the one in the cookie. If an attacker flips the `isAdmin` field from `0` to `1` to become an administrator, the payload changes, the expected signature no longer matches, and `validateToken` returns null. The comparison uses `timingSafeEqual` rather than `===`, because a plain comparison returns faster on an early-byte mismatch, and that timing difference can leak the correct signature one byte at a time. Therefore the constant-time comparison closes a side channel that a naive check would leave open.
+The application recomputes the expected signature from the payload and compares it with the one in the cookie. If an attacker flips the `isAdmin` field from `0` to `1` to become an administrator, the payload changes, the expected signature no longer matches, and `validateToken` returns null. The comparison uses `timingSafeEqual` rather than `===`, because a plain comparison returns faster on an early-byte mismatch, and that timing difference can leak the correct signature one byte at a time. Therefore the constant-time comparison closes a side channel that a naive check would leave open. Without the signature, the cookie would flip as easily as changing a plain `loggedin=0` value to `loggedin=1`. The signature is what turns that edit into a dead end.
 
 ### 3. Cross-site scripting
 
@@ -153,6 +168,7 @@ The five mechanisms above are the application's primary defenses. The rest of th
 
 - **Security Misconfiguration (A02)** is handled in [`next.config.ts`](../next.config.ts), which sets a Content-Security-Policy, HSTS, an `X-Frame-Options` deny rule, a content-type nosniff rule, a Referrer-Policy, and a Permissions-Policy on every response. Errors return structured JSON through `transformError`, which strips stack traces and database details before they reach the client.
 - **Software Supply Chain Failures (A03)** are limited by a committed lock file with integrity hashes, a clean `npm audit`, and pinned [`package.json`](../package.json) overrides for transitive fixes. The runtime and frameworks are current, running Node 22, Next.js 16, Prisma 7, and React 19.
+- **Cryptographic Failures (A04)** cover more than the signed cookie above. Stored PII in the referral, suppression, and consent tables is encrypted at rest with AES-256-GCM, which is authenticated encryption that draws a fresh IV from a secure random generator for every value, so identical inputs never produce identical ciphertext. Lookups use a keyed HMAC blind index instead of the raw value.
 - **Insecure Design (A06)** is addressed by controls that are design choices. Rate limiters cap login, referral, member-lookup, and message-send traffic at five requests per sixty seconds. A daily email quota of 300 is enforced with an atomic Redis INCRBY, so two concurrent sends cannot both slip under the limit. An idempotency key with Redis SET NX stops a double-submitted referral form from creating duplicates. Photo uploads check the file's magic bytes and a 2 MB ceiling on the server.
 - **Authentication Failures (A07)** are covered above. The one-hour token, the rate-limited callback, and an identical redirect for valid and invalid tokens, which prevents account enumeration, all live here.
 - **Software or Data Integrity Failures (A08)** are limited because Zod schemas strip unknown fields, so an attacker cannot smuggle extra properties into a database write. The HMAC cookie gives the session integrity, and no third-party scripts load from a CDN at runtime.
