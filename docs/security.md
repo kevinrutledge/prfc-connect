@@ -181,5 +181,5 @@ PRFC Connect protects member data by sending every request through four independ
 
 ## References
 
-- OWASP Top 10:2025. https://owasp.org/Top10/2025/ . Category sources saved in [`mastery_extension/owasp/`](../mastery_extension/owasp/).
+- OWASP Top 10:2025. https://owasp.org/Top10/2025/
 - PRFC Connect source code, files cited inline by path.
